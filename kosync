@@ -1,0 +1,1088 @@
+#!/usr/bin/env python3
+"""
+kosync - sync KOReader reading metadata from a Kindle into a Calibre library.
+
+Reads KOReader sidecars (*.sdr/*.lua) and settings/statistics.sqlite3 off a
+Kindle mounted over MTP, matches each book to a Calibre library entry, and
+writes progress, status, dates, reading time, highlights and bookmarks into
+Calibre custom columns.
+
+Usage:
+    kosync                # sync everything
+    kosync --dry-run      # show what would change, write nothing
+    kosync --no-add       # never import unmatched sideloaded books
+    kosync -v             # per-book detail
+"""
+
+import argparse
+import datetime as dt
+import difflib
+import html
+import math
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import unicodedata
+from pathlib import Path
+
+# --------------------------------------------------------------------------
+# Configuration
+# --------------------------------------------------------------------------
+
+LIBRARY = Path.home() / "Calibre Library"
+STAGE = Path.home() / ".cache" / "kosync"
+FLATPAK_APP = "com.calibre_ebook.calibre"
+
+# label -> (display name, datatype)
+COLUMNS = {
+    "ko_progfloat":        ("KOReader Precise Progress", "float"),
+    "ko_progint":          ("KOReader Progress",         "int"),
+    "ko_status":           ("KOReader Book Status",      "text"),
+    "ko_statusbool":       ("KOReader Book Status Y/N",  "bool"),
+    "ko_loc":              ("KOReader Last Location",    "text"),
+    "ko_start":            ("Date KOReader Started",     "datetime"),
+    "ko_finish":           ("Date KOReader Finished",    "datetime"),
+    "ko_review":           ("KOReader Review",           "comments"),
+    "ko_bookmarks":        ("KOReader Bookmarks",        "comments"),
+    "koreader_highlights": ("KOReader Highlights",       "comments"),
+    "ko_readtime":         ("KOReader Reading Time",     "int"),
+    "ko_readpages":        ("KOReader Pages Read",       "int"),
+}
+
+BOOK_EXTS = {".epub", ".mobi", ".azw3", ".azw", ".pdf", ".fb2", ".djvu", ".cbz", ".txt"}
+
+# --------------------------------------------------------------------------
+# Lua sidecar parser
+#
+# KOReader dumps sidecars with a restricted Lua subset: `return { ... }` with
+# ["key"] = value / [1] = value entries, strings written via string.format("%q")
+# (so a newline is escaped as backslash + real newline), numbers, booleans, nil
+# and nested tables. This is a small recursive-descent parser for exactly that.
+# --------------------------------------------------------------------------
+
+class LuaError(Exception):
+    pass
+
+
+_ESCAPES = {"a": "\a", "b": "\b", "f": "\f", "n": "\n", "r": "\r",
+            "t": "\t", "v": "\v", "\\": "\\", '"': '"', "'": "'", "\n": "\n"}
+
+
+class LuaParser:
+    def __init__(self, text):
+        self.s = text
+        self.i = 0
+        self.n = len(text)
+
+    def error(self, msg):
+        line = self.s.count("\n", 0, self.i) + 1
+        raise LuaError(f"{msg} at line {line}")
+
+    def ws(self):
+        while self.i < self.n:
+            c = self.s[self.i]
+            if c in " \t\r\n":
+                self.i += 1
+            elif self.s.startswith("--", self.i):
+                # long comment --[[ ... ]] or line comment
+                if self.s.startswith("--[[", self.i):
+                    end = self.s.find("]]", self.i)
+                    self.i = self.n if end < 0 else end + 2
+                else:
+                    end = self.s.find("\n", self.i)
+                    self.i = self.n if end < 0 else end + 1
+            else:
+                break
+
+    def expect(self, ch):
+        self.ws()
+        if self.i >= self.n or self.s[self.i] != ch:
+            self.error(f"expected {ch!r}")
+        self.i += 1
+
+    def parse_string(self):
+        quote = self.s[self.i]
+        self.i += 1
+        out = []
+        while self.i < self.n:
+            c = self.s[self.i]
+            if c == "\\":
+                self.i += 1
+                if self.i >= self.n:
+                    self.error("unterminated escape")
+                e = self.s[self.i]
+                if e.isdigit():
+                    num = ""
+                    while self.i < self.n and self.s[self.i].isdigit() and len(num) < 3:
+                        num += self.s[self.i]
+                        self.i += 1
+                    out.append(chr(int(num)))
+                    continue
+                if e == "x":
+                    hx = self.s[self.i + 1:self.i + 3]
+                    out.append(chr(int(hx, 16)))
+                    self.i += 3
+                    continue
+                out.append(_ESCAPES.get(e, e))
+                self.i += 1
+            elif c == quote:
+                self.i += 1
+                return "".join(out)
+            else:
+                out.append(c)
+                self.i += 1
+        self.error("unterminated string")
+
+    def parse_value(self):
+        self.ws()
+        if self.i >= self.n:
+            self.error("unexpected end of input")
+        c = self.s[self.i]
+        if c in "\"'":
+            return self.parse_string()
+        if c == "{":
+            return self.parse_table()
+        if self.s.startswith("true", self.i):
+            self.i += 4
+            return True
+        if self.s.startswith("false", self.i):
+            self.i += 5
+            return False
+        if self.s.startswith("nil", self.i):
+            self.i += 3
+            return None
+        m = re.match(r"-?(?:0[xX][0-9a-fA-F]+|\d+\.?\d*(?:[eE][-+]?\d+)?|\.\d+(?:[eE][-+]?\d+)?)",
+                     self.s[self.i:])
+        if m:
+            self.i += m.end()
+            txt = m.group(0)
+            if txt.lower().startswith("0x") or txt.lstrip("-").lower().startswith("0x"):
+                return int(txt, 16)
+            if "." in txt or "e" in txt.lower():
+                return float(txt)
+            return int(txt)
+        self.error("unrecognised value")
+
+    def parse_table(self):
+        self.expect("{")
+        result = {}
+        seq = []
+        while True:
+            self.ws()
+            if self.i >= self.n:
+                self.error("unterminated table")
+            if self.s[self.i] == "}":
+                self.i += 1
+                break
+            if self.s[self.i] == "[":
+                self.i += 1
+                key = self.parse_value()
+                self.expect("]")
+                self.expect("=")
+                result[key] = self.parse_value()
+            else:
+                m = re.match(r"[A-Za-z_]\w*\s*=", self.s[self.i:])
+                if m:
+                    key = m.group(0).rstrip("= \t").strip()
+                    self.i += m.end()
+                    result[key] = self.parse_value()
+                else:
+                    seq.append(self.parse_value())
+            self.ws()
+            if self.i < self.n and self.s[self.i] in ",;":
+                self.i += 1
+        for idx, val in enumerate(seq, 1):
+            result.setdefault(idx, val)
+        return result
+
+
+def parse_lua(text):
+    """Parse a KOReader `return { ... }` sidecar into nested dicts."""
+    idx = text.find("return")
+    if idx < 0:
+        raise LuaError("no 'return' found")
+    p = LuaParser(text)
+    p.i = idx + len("return")
+    return p.parse_value()
+
+
+def lua_array(table):
+    """Turn a Lua table with 1..n integer keys into an ordered list."""
+    if not isinstance(table, dict):
+        return []
+    keys = sorted(k for k in table if isinstance(k, int))
+    return [table[k] for k in keys]
+
+
+# --------------------------------------------------------------------------
+# Device discovery and staging
+# --------------------------------------------------------------------------
+
+def find_device():
+    """Locate the Kindle's documents/ and koreader/ dirs on a gvfs MTP mount."""
+    roots = []
+    gvfs = Path(f"/run/user/{os.getuid()}/gvfs")
+    if gvfs.is_dir():
+        for entry in gvfs.iterdir():
+            if "kindle" in entry.name.lower() or "mtp:host=" in entry.name.lower():
+                roots.append(entry)
+    # Older Kindles present as plain USB mass storage.
+    for base in (Path("/run/media") / os.environ.get("USER", ""), Path("/media")):
+        if base.is_dir():
+            roots.extend(p for p in base.iterdir() if p.is_dir())
+
+    for root in roots:
+        for candidate in (root, root / "Internal Storage"):
+            if (candidate / "koreader").is_dir() and (candidate / "documents").is_dir():
+                return candidate
+    return None
+
+
+def stage_device_files(device, stage, verbose=False):
+    """Copy sidecars + statistics DB off MTP into a local staging dir.
+
+    MTP reads are slow and can drop out mid-transfer, so everything is pulled
+    once up front and all later parsing happens against local files.
+    """
+    # Clear only what staging owns; sibling directories such as backups/ stay.
+    for sub in ("sdr", "import"):
+        shutil.rmtree(stage / sub, ignore_errors=True)
+    stage.mkdir(parents=True, exist_ok=True)
+
+    stats_src = device / "koreader" / "settings" / "statistics.sqlite3"
+    stats_dst = stage / "statistics.sqlite3"
+    if stats_src.exists():
+        shutil.copyfile(stats_src, stats_dst)
+    else:
+        stats_dst = None
+
+    sidecars = []
+    docs = device / "documents"
+    for dirpath, dirnames, filenames in os.walk(docs):
+        current = Path(dirpath)
+        if current.name.endswith(".sdr"):
+            dirnames[:] = []          # sidecar dirs never nest
+            meta = anno = None
+            for name in filenames:
+                if name.endswith(".annotations.lua"):
+                    anno = current / name
+                elif name.startswith("metadata.") and name.endswith(".lua"):
+                    meta = current / name
+            if not meta and not anno:
+                continue
+            local = stage / "sdr" / str(len(sidecars))
+            local.mkdir(parents=True)
+            record = {"sdr_name": current.name, "sdr_device_path": current}
+            for key, src in (("meta", meta), ("anno", anno)):
+                if src:
+                    dst = local / src.name
+                    try:
+                        shutil.copyfile(src, dst)
+                        record[key] = dst
+                    except OSError as exc:
+                        warn(f"could not read {src.name}: {exc}")
+            sidecars.append(record)
+            if verbose:
+                print(f"  staged {current.name}")
+    return stats_dst, sidecars
+
+
+# --------------------------------------------------------------------------
+# KOReader data extraction
+# --------------------------------------------------------------------------
+
+def load_statistics(path):
+    """Return {md5: stats-dict} from KOReader's statistics.sqlite3."""
+    if not path or not path.exists():
+        return {}
+    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    con.row_factory = sqlite3.Row
+    rows = con.execute("""
+        SELECT b.md5, b.title, b.authors, b.pages,
+               b.total_read_time, b.total_read_pages,
+               b.highlights, b.notes, b.last_open,
+               MIN(p.start_time) AS first_session,
+               MAX(p.start_time) AS last_session
+          FROM book b
+     LEFT JOIN page_stat_data p ON p.id_book = b.id
+      GROUP BY b.id
+    """).fetchall()
+    con.close()
+
+    stats = {}
+    for row in rows:
+        if not row["md5"]:
+            continue
+        stats[row["md5"]] = {
+            "title": row["title"],
+            "authors": row["authors"],
+            "pages": row["pages"],
+            "read_time": row["total_read_time"] or 0,
+            "read_pages": row["total_read_pages"] or 0,
+            "highlights": row["highlights"] or 0,
+            "notes": row["notes"] or 0,
+            "last_open": row["last_open"],
+            "first_session": row["first_session"],
+            "last_session": row["last_session"],
+        }
+    return stats
+
+
+def read_sidecar(record):
+    """Parse one staged sidecar into a normalised reading record."""
+    data = {}
+    if record.get("meta"):
+        try:
+            data = parse_lua(record["meta"].read_text(encoding="utf-8", errors="replace"))
+        except (LuaError, OSError) as exc:
+            warn(f"could not parse {record['sdr_name']}: {exc}")
+            data = {}
+
+    annotations = lua_array(data.get("annotations") or {})
+    if record.get("anno"):
+        try:
+            extra = parse_lua(record["anno"].read_text(encoding="utf-8", errors="replace"))
+            annotations = lua_array(extra.get("annotations") or {}) or annotations
+        except (LuaError, OSError) as exc:
+            warn(f"could not parse annotations for {record['sdr_name']}: {exc}")
+
+    props = data.get("doc_props") or {}
+    summary = data.get("summary") or {}
+    doc_path = data.get("doc_path") or ""
+
+    # Book filename as it sits on the device: the .sdr name minus the suffix.
+    stem = record["sdr_name"][:-4]
+    device_file = None
+    parent = record["sdr_device_path"].parent
+    for ext in BOOK_EXTS:
+        for cand in (parent / (stem + ext), parent / (stem + ext.upper())):
+            if cand.exists():
+                device_file = cand
+                break
+        if device_file:
+            break
+
+    return {
+        "sdr_name": record["sdr_name"],
+        "md5": data.get("partial_md5_checksum"),
+        "title": (props.get("title") or "").strip() or Path(stem).stem,
+        "authors": (props.get("authors") or "").strip(),
+        "percent": data.get("percent_finished"),
+        "status": (summary.get("status") or "").strip().lower() or None,
+        "rating": summary.get("rating"),
+        "review": (summary.get("note") or "").strip() or None,
+        "modified": summary.get("modified"),
+        "location": data.get("last_xpointer") or data.get("last_page") or None,
+        "doc_pages": data.get("doc_pages"),
+        "annotations": [a for a in annotations if isinstance(a, dict)],
+        "doc_path": doc_path,
+        "device_file": device_file,
+    }
+
+
+def build_records(sidecars, stats):
+    """Merge sidecar records with statistics rows into one list of books."""
+    records = []
+    used_md5 = set()
+
+    for sc in sidecars:
+        rec = read_sidecar(sc)
+        st = stats.get(rec["md5"]) if rec["md5"] else None
+        if st:
+            used_md5.add(rec["md5"])
+        rec["stats"] = st or {}
+        rec["source"] = "sidecar"
+        records.append(rec)
+
+    # Books KOReader has read-time for but whose sidecar is gone from the device.
+    for md5, st in stats.items():
+        if md5 in used_md5:
+            continue
+        if not st["read_time"] and not st["read_pages"]:
+            continue
+        records.append({
+            "sdr_name": None, "md5": md5,
+            "title": (st["title"] or "").strip(),
+            "authors": (st["authors"] or "").strip(),
+            "percent": None, "status": None, "rating": None, "review": None,
+            "modified": None, "location": None, "doc_pages": st["pages"],
+            "annotations": [], "doc_path": "", "device_file": None,
+            "stats": st, "source": "stats",
+        })
+    return records
+
+
+# --------------------------------------------------------------------------
+# Title matching
+# --------------------------------------------------------------------------
+
+_ARTICLES = ("the ", "a ", "an ")
+
+# Words that carry no identifying information in an author field.
+_AUTHOR_STOPWORDS = {"dr", "prof", "professor", "jr", "sir",
+                     "unknown", "anonymous", "nil", "various", "none"}
+
+# Calibre names files it sends to a device "<title> - <authors> (<id>)".
+CALIBRE_DEVICE_NAME = re.compile(r"^(?P<title>.+?)\s+-\s+(?P<authors>.+?)\s+\((?P<id>\d+)\)$")
+
+
+def authors_agree(a, b):
+    """True when two author token sets plausibly name the same person.
+
+    An empty side means we cannot judge, so it never blocks a match. Spelling
+    variants such as Dostoyevsky / Dostoevsky are treated as agreement.
+    """
+    if not a or not b:
+        return True
+    if a & b:
+        return True
+    return any(difflib.SequenceMatcher(None, x, y).ratio() >= 0.85
+               for x in a for y in b)
+
+
+def name_candidates(rec):
+    """Ordered (title, authors) guesses for matching a record to Calibre.
+
+    KOReader's embedded doc_props are tried first; failing that the device
+    filename is unpicked, which recovers the title and author for books whose
+    Calibre id has since changed.
+    """
+    guesses = []
+    if rec.get("title"):
+        guesses.append((rec["title"], rec.get("authors") or ""))
+    if rec.get("sdr_name"):
+        stem = rec["sdr_name"][:-4]
+        m = CALIBRE_DEVICE_NAME.match(stem)
+        if m:
+            guesses.append((m.group("title"), m.group("authors")))
+        else:
+            guesses.append((stem, rec.get("authors") or ""))
+
+    seen, unique = set(), []
+    for title, authors in guesses:
+        key = normalise(title)
+        if key and key not in seen:
+            seen.add(key)
+            unique.append((title, authors))
+    return unique
+
+
+def normalise(text):
+    if not text:
+        return ""
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(c for c in text if not unicodedata.combining(c))
+    text = text.lower()
+    text = text.replace("&", " and ")
+    text = re.sub(r"[_\-]+", " ", text)
+    text = re.sub(r"[^a-z0-9 ]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    for art in _ARTICLES:
+        if text.startswith(art):
+            text = text[len(art):]
+            break
+    return text
+
+
+def short_title(text):
+    """Drop a trailing subtitle so 'Title: Subtitle' can match a bare 'Title'."""
+    base = re.split(r"[:;]| -- ", text, maxsplit=1)[0]
+    return normalise(base)
+
+
+def author_tokens(text):
+    if not text:
+        return set()
+    text = re.sub(r"[\n;&]+", ",", text)
+    tokens = set()
+    for part in text.split(","):
+        for word in normalise(part).split():
+            if len(word) > 2 and word not in _AUTHOR_STOPWORDS:
+                tokens.add(word)
+    return tokens
+
+
+class CalibreIndex:
+    def __init__(self, library):
+        db = library / "metadata.db"
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        con.row_factory = sqlite3.Row
+        self.books = {}
+        for row in con.execute("""
+            SELECT b.id, b.title,
+                   (SELECT GROUP_CONCAT(a.name, ' & ')
+                      FROM books_authors_link l JOIN authors a ON a.id = l.author
+                     WHERE l.book = b.id) AS authors
+              FROM books b
+        """):
+            self.books[row["id"]] = {
+                "title": row["title"] or "",
+                "authors": row["authors"] or "",
+                "norm": normalise(row["title"]),
+                "short": short_title(row["title"] or ""),
+                "authtok": author_tokens(row["authors"] or ""),
+            }
+        con.close()
+
+        self.by_norm = {}
+        self.by_short = {}
+        for bid, info in self.books.items():
+            self.by_norm.setdefault(info["norm"], []).append(bid)
+            self.by_short.setdefault(info["short"], []).append(bid)
+
+    def _disambiguate(self, ids, authtok):
+        if len(ids) == 1:
+            bid = ids[0]
+            if authors_agree(authtok, self.books[bid]["authtok"]):
+                return bid, 1.0
+            return None, 0.0
+        if not authtok:
+            return None, 0.0
+        best, score = None, 0.0
+        for bid in ids:
+            overlap = len(authtok & self.books[bid]["authtok"])
+            if overlap > score:
+                best, score = bid, overlap
+        return (best, 0.95) if best else (None, 0.0)
+
+    def confirms(self, book_id, guesses):
+        """True when the Calibre book with this id is plausibly the one the device names.
+
+        Calibre's id in a device filename outlives the book it was given to: remove
+        a book and add others, and the id can come back on a different book. So an
+        id is only trusted when the title (or its stem) and authors agree with one
+        of the record's (title, authors) guesses.
+        """
+        info = self.books.get(book_id)
+        if not info:
+            return False
+        for title, authors in guesses:
+            norm, stem = normalise(title), short_title(title)
+            if not norm:
+                continue
+            same = (norm == info["norm"] or stem == info["short"]
+                    or difflib.SequenceMatcher(None, norm, info["norm"]).ratio() >= 0.85
+                    # Calibre cuts long titles short in the filenames it writes.
+                    or (min(len(norm), len(info["norm"])) >= 12
+                        and (norm.startswith(info["norm"]) or info["norm"].startswith(norm))))
+            if same and authors_agree(author_tokens(authors), info["authtok"]):
+                return True
+        return False
+
+    def register(self, book_id, title, authors):
+        """Add a newly imported book so later records can match against it."""
+        info = {
+            "title": title, "authors": authors,
+            "norm": normalise(title), "short": short_title(title),
+            "authtok": author_tokens(authors),
+        }
+        self.books[book_id] = info
+        self.by_norm.setdefault(info["norm"], []).append(book_id)
+        self.by_short.setdefault(info["short"], []).append(book_id)
+
+    def match_loose(self, raw):
+        """Match a run-together device filename such as 'Dracula-Bram-Stoker'.
+
+        Looks for a Calibre title that forms the head of the filename, and only
+        accepts it when the leftover words name that book's author - otherwise
+        a short title would swallow anything starting with the same word.
+        """
+        norm = normalise(raw)
+        if len(norm) < 5:
+            return None, 0.0, "no match"
+        best, best_len = None, 0
+        for cand, ids in self.by_norm.items():
+            if len(cand) < 5 or len(cand) <= best_len or not norm.startswith(cand):
+                continue
+            if norm != cand and not norm.startswith(cand + " "):
+                continue
+            leftover = author_tokens(norm[len(cand):])
+            if not leftover:
+                continue
+            for bid in ids:
+                known = self.books[bid]["authtok"]
+                if known and authors_agree(leftover, known):
+                    best, best_len = bid, len(cand)
+                    break
+        return (best, 0.9, "filename") if best else (None, 0.0, "no match")
+
+    def match(self, title, authors):
+        """Return (calibre_id, confidence, how) or (None, 0, reason)."""
+        norm = normalise(title)
+        if not norm:
+            return None, 0.0, "no title"
+        authtok = author_tokens(authors)
+
+        for index, label in ((self.by_norm, "title"), (self.by_short, "title-stem")):
+            key = norm if index is self.by_norm else short_title(title)
+            if key in index:
+                bid, conf = self._disambiguate(index[key], authtok)
+                if bid:
+                    return bid, conf, label
+
+        candidates = difflib.get_close_matches(norm, self.by_norm.keys(), n=5, cutoff=0.85)
+        best, best_score = None, 0.0
+        for cand in candidates:
+            ratio = difflib.SequenceMatcher(None, norm, cand).ratio()
+            for bid in self.by_norm[cand]:
+                score = ratio
+                other = self.books[bid]["authtok"]
+                if authtok and other:
+                    if not authors_agree(authtok, other):
+                        continue
+                    score += 0.05
+                if score > best_score:
+                    best, best_score = bid, score
+        if best and best_score >= 0.88:
+            return best, round(best_score, 3), "fuzzy"
+        return None, 0.0, "no match"
+
+
+# --------------------------------------------------------------------------
+# Rendering
+# --------------------------------------------------------------------------
+
+def esc(text):
+    return html.escape(str(text or "").strip())
+
+
+def split_annotations(annotations):
+    """KOReader stores highlights and dog-ear bookmarks in one list.
+
+    A highlight carries pos0/pos1 (a selected text range); a bookmark does not.
+    """
+    highlights, bookmarks = [], []
+    for a in annotations:
+        (highlights if a.get("pos0") and a.get("pos1") else bookmarks).append(a)
+    return highlights, bookmarks
+
+
+def render_highlights(highlights):
+    if not highlights:
+        return None
+    highlights = sorted(highlights, key=lambda a: (a.get("pageno") or 0,
+                                                   str(a.get("datetime") or "")))
+    parts, chapter = [], object()
+    for a in highlights:
+        chap = (a.get("chapter") or "").strip()
+        if chap != chapter:
+            chapter = chap
+            if chap:
+                parts.append(f"<h4>{esc(chap)}</h4>")
+        meta = []
+        if a.get("pageno"):
+            meta.append(f"p. {a['pageno']}")
+        if a.get("datetime"):
+            meta.append(str(a["datetime"])[:10])
+        if a.get("color"):
+            meta.append(esc(a["color"]))
+        meta_html = " &middot; ".join(esc(item) for item in meta)
+        parts.append(f"<blockquote>{esc(a.get('text'))}</blockquote>"
+                     f"<p><em>{meta_html}</em></p>")
+        if a.get("note"):
+            parts.append(f"<p><strong>Note:</strong> {esc(a['note'])}</p>")
+    return "\n".join(parts)
+
+
+def render_bookmarks(bookmarks):
+    if not bookmarks:
+        return None
+    rows = []
+    for a in sorted(bookmarks, key=lambda x: (x.get("pageno") or 0)):
+        bits = []
+        if a.get("pageno"):
+            bits.append(f"p. {a['pageno']}")
+        if a.get("chapter"):
+            bits.append(esc(a["chapter"]))
+        if a.get("datetime"):
+            bits.append(str(a["datetime"])[:10])
+        label = " &middot; ".join(bits)
+        note = esc(a.get("note") or a.get("text"))
+        rows.append(f"<li>{label}{': ' + note if note else ''}</li>")
+    return "<ul>\n" + "\n".join(rows) + "\n</ul>"
+
+
+def to_datetime(value):
+    """Accept a unix timestamp or 'YYYY-MM-DD[ HH:MM:SS]' and return ISO text."""
+    if value in (None, "", 0):
+        return None
+    if isinstance(value, (int, float)):
+        return dt.datetime.fromtimestamp(value).replace(microsecond=0).isoformat()
+    text = str(value).strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return dt.datetime.strptime(text, fmt).replace(microsecond=0).isoformat()
+        except ValueError:
+            continue
+    return None
+
+
+def build_fields(rec, min_seconds=0):
+    """Turn a merged reading record into {column_label: value} for Calibre.
+
+    Records that only exist in the statistics database are dropped when the
+    book was open for less than min_seconds; sidecar-backed records always
+    sync, because an explicit status or progress is deliberate.
+    """
+    fields = {}
+    stats = rec.get("stats") or {}
+    if rec.get("source") == "stats" and (stats.get("read_time") or 0) < min_seconds:
+        return {}
+    annotations = rec.get("annotations") or []
+    highlights, bookmarks = split_annotations(annotations)
+
+    percent = rec.get("percent")
+    status = rec.get("status")
+    if status == "complete":
+        percent = 1.0
+    if percent is not None:
+        pct = max(0.0, min(1.0, float(percent))) * 100
+        fields["ko_progfloat"] = round(pct, 2)
+        fields["ko_progint"] = int(round(pct))
+
+    if status:
+        fields["ko_status"] = status
+        fields["ko_statusbool"] = "true" if status == "complete" else "false"
+
+    if rec.get("location"):
+        fields["ko_loc"] = str(rec["location"])
+
+    started = to_datetime(stats.get("first_session"))
+    if not started and annotations:
+        dates = sorted(str(a.get("datetime")) for a in annotations if a.get("datetime"))
+        if dates:
+            started = to_datetime(dates[0])
+    if started:
+        fields["ko_start"] = started
+
+    if status == "complete":
+        finished = to_datetime(rec.get("modified")) or to_datetime(stats.get("last_session"))
+        if finished:
+            fields["ko_finish"] = finished
+
+    if rec.get("review"):
+        fields["ko_review"] = f"<p>{esc(rec['review'])}</p>"
+
+    highlight_html = render_highlights(highlights)
+    if highlight_html:
+        fields["koreader_highlights"] = highlight_html
+    bookmark_html = render_bookmarks(bookmarks)
+    if bookmark_html:
+        fields["ko_bookmarks"] = bookmark_html
+
+    if stats.get("read_time"):
+        fields["ko_readtime"] = max(1, math.ceil(stats["read_time"] / 60))
+    if stats.get("read_pages"):
+        fields["ko_readpages"] = int(stats["read_pages"])
+
+    rating = rec.get("rating")
+    if isinstance(rating, (int, float)) and rating > 0:
+        fields["__rating__"] = int(min(5, max(0, round(rating)))) * 2
+    return fields
+
+
+def merge_fields(target, new):
+    """Fold a second reading record for the same Calibre book into the first.
+
+    The same book can appear more than once - a sidecar plus a statistics row,
+    or two copies of the file read under different names - so counters take the
+    larger value, dates widen the span, and prose keeps the fuller text.
+    """
+    for key, value in new.items():
+        if key not in target:
+            target[key] = value
+        elif key in ("ko_readtime", "ko_readpages", "ko_progfloat", "ko_progint"):
+            target[key] = max(target[key], value)
+        elif key == "ko_start":
+            target[key] = min(target[key], value)
+        elif key == "ko_finish":
+            target[key] = max(target[key], value)
+        elif len(str(value)) > len(str(target[key])):
+            target[key] = value
+    return target
+
+
+# --------------------------------------------------------------------------
+# Calibre command line
+# --------------------------------------------------------------------------
+
+def calibredb_cmd():
+    native = shutil.which("calibredb")
+    if native:
+        return [native]
+    if shutil.which("flatpak"):
+        installed = subprocess.run(["flatpak", "info", FLATPAK_APP],
+                                   capture_output=True, text=True)
+        if installed.returncode == 0:
+            return ["flatpak", "run", "--command=calibredb", FLATPAK_APP]
+    return None
+
+
+def run_calibredb(base, args, check=True):
+    cmd = base + ["--with-library", str(LIBRARY)] + args
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if check and proc.returncode != 0:
+        raise RuntimeError((proc.stderr or proc.stdout).strip())
+    return proc
+
+
+def backup_library(keep=5):
+    """Snapshot metadata.db before writing, keeping the last few copies.
+
+    Cheap insurance: everything kosync writes lives in this one file, so a bad
+    run can be undone by copying a snapshot back over it.
+    """
+    backups = STAGE / "backups"
+    backups.mkdir(parents=True, exist_ok=True)
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    target = backups / f"metadata-{stamp}.db"
+    shutil.copyfile(LIBRARY / "metadata.db", target)
+    for old in sorted(backups.glob("metadata-*.db"))[:-keep]:
+        old.unlink()
+    return target
+
+
+def calibre_is_running():
+    """True when a Calibre GUI or content server currently holds the library.
+
+    Matches on the process's own argv rather than a loose pgrep, so a shell
+    that merely mentions calibre on its command line is not mistaken for it.
+    """
+    proc = subprocess.run(["ps", "-eo", "pid=,args="], capture_output=True, text=True)
+    me = str(os.getpid())
+    pattern = re.compile(r"(^|[ /])(calibre|calibre-server|calibre-parallel)( |$)")
+    for line in proc.stdout.splitlines():
+        pid, _, args = line.strip().partition(" ")
+        if pid == me or "kosync" in args:
+            continue
+        if pattern.search(args):
+            return True
+    return False
+
+
+def existing_columns():
+    db = LIBRARY / "metadata.db"
+    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    labels = {r[0] for r in con.execute("SELECT label FROM custom_columns")}
+    con.close()
+    return labels
+
+
+def ensure_columns(base, dry_run):
+    present = existing_columns()
+    created = []
+    for label, (name, datatype) in COLUMNS.items():
+        if label in present:
+            continue
+        created.append(label)
+        if dry_run:
+            continue
+        run_calibredb(base, ["add_custom_column", label, name, datatype])
+    return created
+
+
+def add_book(base, path):
+    """Import a book file into the library, returning its new Calibre id."""
+    proc = run_calibredb(base, ["add", "--duplicates", str(path)])
+    match = re.search(r"Added book ids:\s*([\d,\s]+)", proc.stdout)
+    if not match:
+        return None
+    return int(match.group(1).split(",")[0].strip())
+
+
+def apply_fields(base, book_id, fields):
+    args = ["set_metadata", str(book_id)]
+    for label, value in fields.items():
+        key = "rating" if label == "__rating__" else f"#{label}"
+        args += ["--field", f"{key}:{value}"]
+    run_calibredb(base, args)
+
+
+# --------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------
+
+WARNINGS = []
+
+
+def warn(message):
+    WARNINGS.append(message)
+
+
+def human_time(minutes):
+    hours, mins = divmod(int(minutes), 60)
+    return f"{hours}h {mins:02d}m" if hours else f"{mins}m"
+
+
+def main():
+    global LIBRARY
+
+    ap = argparse.ArgumentParser(
+        prog="kosync",
+        description="Sync KOReader reading metadata from a Kindle into Calibre.")
+    ap.add_argument("--library", type=Path, default=LIBRARY,
+                    help=f"Calibre library path (default: {LIBRARY})")
+    ap.add_argument("--device", type=Path,
+                    help="Kindle root, if auto-detection fails")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="report what would change without writing")
+    ap.add_argument("--no-add", action="store_true",
+                    help="do not import unmatched sideloaded books")
+    ap.add_argument("--min-seconds", type=int, default=0, metavar="N",
+                    help="ignore books read for less than N seconds "
+                         "(statistics-only entries; default 0, sync everything)")
+    ap.add_argument("-v", "--verbose", action="store_true",
+                    help="show a line per book")
+    args = ap.parse_args()
+    LIBRARY = args.library
+
+    if not (LIBRARY / "metadata.db").exists():
+        sys.exit(f"error: no Calibre library at {LIBRARY}")
+
+    base = calibredb_cmd()
+    if not base:
+        sys.exit("error: calibredb not found (install Calibre or its Flatpak)")
+
+    if not args.dry_run and calibre_is_running():
+        sys.exit("error: Calibre is running, and calibredb refuses to write to a\n"
+                 "library that another Calibre process has open.\n"
+                 "Close the Calibre window and run kosync again "
+                 "(or use --dry-run to preview).")
+
+    device = args.device or find_device()
+    if not device:
+        sys.exit("error: no Kindle found. Plug it in, unlock it, and make sure the\n"
+                 "file manager shows it (it mounts over MTP).")
+    print(f"Device:  {device}")
+    print(f"Library: {LIBRARY}")
+
+    created = ensure_columns(base, args.dry_run)
+    if created:
+        verb = "would create" if args.dry_run else "created"
+        print(f"Columns: {verb} {', '.join('#' + c for c in created)}")
+
+    print("Staging KOReader data off the device...")
+    stats_db, sidecars = stage_device_files(device, STAGE, args.verbose)
+    if not args.dry_run:
+        print(f"Backup:  {backup_library()}")
+    stats = load_statistics(stats_db)
+    records = build_records(sidecars, stats)
+    print(f"Found {len(sidecars)} sidecars and {len(stats)} books with reading statistics.")
+
+    index = CalibreIndex(LIBRARY)
+
+    added = skipped = 0
+    resolved = {}          # calibre id -> merged fields and provenance
+    unmatched = []
+
+    # Pass 1: work out which Calibre book each reading record belongs to.
+    for rec in sorted(records, key=lambda r: (r.get("title") or "").lower()):
+        fields = build_fields(rec, args.min_seconds)
+        if not fields:
+            skipped += 1
+            continue
+
+        book_id = how = None
+        # Calibre writes its book id into the filenames it sends to a device,
+        # but that id goes stale if the book is later removed and re-added -
+        # and can then belong to a different book, so the title must agree too.
+        if rec["sdr_name"]:
+            m = re.search(r"\((\d+)\)\.sdr$", rec["sdr_name"])
+            if m and index.confirms(int(m.group(1)), name_candidates(rec)):
+                book_id, how = int(m.group(1)), "calibre id"
+        if book_id is None:
+            for title, authors in name_candidates(rec):
+                book_id, _, how = index.match(title, authors)
+                if book_id:
+                    break
+        if book_id is None and rec["sdr_name"]:
+            book_id, _, how = index.match_loose(rec["sdr_name"][:-4])
+
+        if book_id is None:
+            if rec.get("device_file") and not args.no_add:
+                if args.dry_run:
+                    print(f"  + would import  {rec['title'][:60]}")
+                    added += 1
+                    index.register(-added, rec["title"], rec["authors"])
+                    continue
+                local = STAGE / "import" / rec["device_file"].name
+                local.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    shutil.copyfile(rec["device_file"], local)
+                    book_id = add_book(base, local)
+                except (OSError, RuntimeError) as exc:
+                    warn(f"import failed for {rec['title']}: {exc}")
+                    book_id = None
+                finally:
+                    local.unlink(missing_ok=True)
+                if book_id:
+                    added += 1
+                    how = "imported"
+                    index.register(book_id, rec["title"], rec["authors"])
+            if book_id is None:
+                unmatched.append(rec)
+                continue
+
+        entry = resolved.setdefault(book_id, {"fields": {}, "how": how, "highlights": 0})
+        merge_fields(entry["fields"], fields)
+        entry["highlights"] += len(split_annotations(rec["annotations"])[0])
+
+    # Pass 2: write one update per Calibre book.
+    synced = 0
+    for book_id, entry in sorted(resolved.items(),
+                                 key=lambda kv: index.books[kv[0]]["title"].lower()):
+        if book_id < 0:                     # placeholder for a pending import
+            continue
+        fields = entry["fields"]
+        if args.verbose or args.dry_run:
+            summary = []
+            if "ko_progint" in fields:
+                summary.append(f"{fields['ko_progint']}%")
+            if "ko_status" in fields:
+                summary.append(fields["ko_status"])
+            if "ko_readtime" in fields:
+                summary.append(human_time(fields["ko_readtime"]))
+            if entry["highlights"]:
+                summary.append(f"{entry['highlights']} highlights")
+            arrow = "would sync" if args.dry_run else "sync"
+            title = index.books[book_id]["title"]
+            print(f"  {arrow:>10}  [{book_id:>5}] {title[:52]:54} "
+                  f"{', '.join(summary)}  ({entry['how']})")
+
+        if not args.dry_run:
+            try:
+                apply_fields(base, book_id, fields)
+            except RuntimeError as exc:
+                warn(f"write failed for {index.books[book_id]['title']}: {exc}")
+                continue
+        synced += 1
+
+    print()
+    verb = "Would sync" if args.dry_run else "Synced"
+    print(f"{verb}: {synced} book(s)")
+    if added:
+        print(f"{'Would import' if args.dry_run else 'Imported'}: {added} new book(s)")
+    if skipped:
+        print(f"Skipped: {skipped} book(s) with no usable KOReader data")
+    if unmatched:
+        print(f"\nNo Calibre match ({len(unmatched)}) - these were left alone:")
+        for rec in unmatched[:40]:
+            author = f" - {rec['authors'].splitlines()[0]}" if rec["authors"] else ""
+            print(f"  - {rec['title'][:60]}{author[:40]}")
+        if len(unmatched) > 40:
+            print(f"  ... and {len(unmatched) - 40} more")
+    if WARNINGS:
+        print(f"\nWarnings ({len(WARNINGS)}):")
+        for message in WARNINGS[:20]:
+            print(f"  ! {message}")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

@@ -1,0 +1,232 @@
+#!/usr/bin/env bash
+#
+# kindle — one entry point for the MTP-only Kindle Paperwhite.
+#
+# The Kindle can only be owned by one MTP program at a time:
+#   gvfs mode     -> mounts in Files; `kosync` can read reading data off it
+#   calibre mode  -> gvfs MTP disabled so Calibre can open it to manage books
+#
+# Run with no arguments for an interactive menu, or:
+#   kindle status        show what state the Kindle is in
+#   kindle sync [args]    run kosync (extra args passed through, e.g. --dry-run)
+#   kindle calibre        switch to calibre mode  (sudo)
+#   kindle gvfs           switch to gvfs mode      (sudo)
+#   kindle mount          (re)mount the Kindle over gvfs
+#
+# After any mode switch, UNPLUG AND REPLUG the Kindle — this model tears down
+# its USB connection when the MTP session ends and will not reattach on its own.
+
+set -uo pipefail
+
+MON_DIR=/usr/share/gvfs/remote-volume-monitors
+MON_ON=$MON_DIR/mtp.monitor
+MON_OFF=$MON_DIR/mtp.monitor.disabled
+USB_VENDOR=1949
+GVFS=/run/user/$(id -u)/gvfs
+
+c_bold=$'\e[1m'; c_dim=$'\e[2m'; c_grn=$'\e[32m'; c_yel=$'\e[33m'
+c_red=$'\e[31m'; c_cyn=$'\e[36m'; c_rst=$'\e[0m'
+[[ -t 1 ]] || { c_bold=; c_dim=; c_grn=; c_yel=; c_red=; c_cyn=; c_rst=; }
+
+# ---------------------------------------------------------------- detection ---
+
+current_mode() {
+    if   [[ -e $MON_ON  ]]; then echo gvfs
+    elif [[ -e $MON_OFF ]]; then echo calibre
+    else echo unknown
+    fi
+}
+
+# echoes "manufacturer|product|serial" for the first Amazon USB device, or nothing
+usb_kindle_info() {
+    local d
+    for d in /sys/bus/usb/devices/*; do
+        [[ -f $d/idVendor ]] || continue
+        [[ $(< "$d/idVendor") == "$USB_VENDOR" ]] || continue
+        printf '%s|%s|%s\n' \
+            "$(cat "$d/manufacturer" 2>/dev/null)" \
+            "$(cat "$d/product" 2>/dev/null)" \
+            "$(cat "$d/serial" 2>/dev/null)"
+        return 0
+    done
+    return 1
+}
+
+usb_present() { usb_kindle_info >/dev/null; }
+
+# the gvfs host string gvfsd-mtp uses, derived from the USB descriptors
+gvfs_host() {
+    local info; info=$(usb_kindle_info) || return 1
+    local manu=${info%%|*} rest=${info#*|}
+    local prod=${rest%%|*} ser=${rest#*|}
+    local h="${manu}_${prod}_${ser}"
+    echo "${h// /_}"
+}
+
+mount_path() {
+    local p
+    for p in "$GVFS"/mtp:host=*; do
+        [[ -d $p ]] && { echo "$p"; return 0; }
+    done
+    return 1
+}
+
+is_mounted() { mount_path >/dev/null; }
+
+calibre_running() { pgrep -x calibre >/dev/null; }
+
+# ------------------------------------------------------------------ actions ---
+
+kill_gvfs_mtp() {
+    pkill -f gvfs-mtp-volume-monitor 2>/dev/null
+    pkill -x gvfsd-mtp 2>/dev/null
+    return 0
+}
+
+do_mount() {
+    if is_mounted; then echo "Already mounted: $(mount_path)"; return 0; fi
+    if [[ $(current_mode) == calibre ]]; then
+        echo "${c_yel}In calibre mode — gvfs MTP is disabled. Switch to gvfs mode first.${c_rst}"
+        return 1
+    fi
+    if ! usb_present; then
+        echo "${c_yel}No Kindle on USB. Plug it in and unlock it.${c_rst}"
+        return 1
+    fi
+    local host; host=$(gvfs_host) || { echo "Could not derive gvfs host."; return 1; }
+    echo "Mounting mtp://$host/ ..."
+    if gio mount "mtp://$host/" 2>/dev/null && is_mounted; then
+        echo "${c_grn}Mounted:${c_rst} $(mount_path)"
+    else
+        echo "${c_yel}Mount didn't take. Open Files and tap the Kindle, or replug it.${c_rst}"
+        return 1
+    fi
+}
+
+switch_to() {
+    local target=$1 cur; cur=$(current_mode)
+    if [[ $cur == unknown ]]; then
+        echo "${c_red}Cannot switch: neither $MON_ON nor $MON_OFF exists."
+        echo "A gvfs package update may have changed things — check $MON_DIR.${c_rst}"
+        return 1
+    fi
+    if [[ $cur == "$target" ]]; then
+        echo "Already in ${c_bold}$target${c_rst} mode."
+    else
+        case $target in
+            calibre) sudo mv "$MON_ON" "$MON_OFF" || return 1
+                     echo "${c_grn}gvfs MTP disabled — Calibre can now claim the Kindle.${c_rst}" ;;
+            gvfs)    sudo mv "$MON_OFF" "$MON_ON" || return 1
+                     echo "${c_grn}gvfs MTP re-enabled — Kindle will mount in Files.${c_rst}" ;;
+        esac
+    fi
+    kill_gvfs_mtp
+    echo
+    if [[ $target == calibre ]]; then
+        calibre_running \
+            && echo "Calibre is running. ${c_bold}Replug the Kindle${c_rst} and it should appear as a device." \
+            || echo "Start Calibre, then ${c_bold}replug the Kindle${c_rst}."
+    else
+        calibre_running \
+            && echo "${c_yel}Quit Calibre before reconnecting the Kindle, or it may grab the device.${c_rst}"
+        echo "${c_bold}Replug the Kindle${c_rst}; it should mount in Files. kosync will work."
+    fi
+}
+
+run_sync() {
+    local mode; mode=$(current_mode)
+    if [[ $mode == calibre ]]; then
+        echo "${c_yel}kosync needs gvfs mode (it reads the Kindle from the Files mount).${c_rst}"
+        read -rp "Switch to gvfs mode now? [y/N] " a
+        [[ ${a,,} == y* ]] || { echo "Aborted."; return 1; }
+        switch_to gvfs
+        echo
+        echo "${c_bold}Replug the Kindle, wait for it to mount, then run sync again.${c_rst}"
+        return 1
+    fi
+    if calibre_running; then
+        echo "${c_red}Calibre is running.${c_rst} calibredb won't write to an open library."
+        echo "Quit Calibre first (or run:  kindle sync --dry-run  to preview safely)."
+        return 1
+    fi
+    is_mounted || do_mount || return 1
+    echo
+    echo "${c_dim}\$ kosync $*${c_rst}"
+    kosync "$@"
+}
+
+# ------------------------------------------------------------------- status ---
+
+print_status() {
+    local mode; mode=$(current_mode)
+    local mode_str
+    case $mode in
+        gvfs)    mode_str="${c_cyn}gvfs${c_rst} ${c_dim}(Files + kosync; Calibre can't open it)${c_rst}" ;;
+        calibre) mode_str="${c_grn}calibre${c_rst} ${c_dim}(Calibre owns it; won't mount in Files, kosync fails)${c_rst}" ;;
+        *)       mode_str="${c_red}unknown${c_rst}" ;;
+    esac
+
+    local usb="no"; local kname=""
+    if usb_present; then
+        usb="${c_grn}connected${c_rst}"
+        local info; info=$(usb_kindle_info); kname=${info#*|}; kname=${kname%%|*}
+    else
+        usb="${c_yel}not connected${c_rst}"
+    fi
+
+    local mnt
+    if is_mounted; then mnt="${c_grn}yes${c_rst} ${c_dim}$(mount_path)${c_rst}"
+    else               mnt="${c_dim}no${c_rst}"; fi
+
+    local cal
+    if calibre_running; then cal="${c_yel}running${c_rst}"; else cal="${c_dim}not running${c_rst}"; fi
+
+    echo "${c_bold}Kindle${c_rst}${kname:+ ${c_dim}— $kname${c_rst}}"
+    printf '  %-9s %b\n' "Mode:"    "$mode_str"
+    printf '  %-9s %b\n' "USB:"     "$usb"
+    printf '  %-9s %b\n' "Mounted:" "$mnt"
+    printf '  %-9s %b\n' "Calibre:" "$cal"
+}
+
+# --------------------------------------------------------------------- menu ---
+
+menu() {
+    while true; do
+        echo
+        print_status
+        echo
+        echo "  ${c_bold}1${c_rst}) Sync reading progress into Calibre     ${c_dim}kosync${c_rst}"
+        echo "  ${c_bold}2${c_rst}) Preview a sync (writes nothing)        ${c_dim}kosync --dry-run${c_rst}"
+        echo "  ${c_bold}3${c_rst}) Switch to Calibre mode  ${c_dim}(manage books in Calibre)${c_rst}"
+        echo "  ${c_bold}4${c_rst}) Switch to gvfs mode     ${c_dim}(Files + kosync)${c_rst}"
+        echo "  ${c_bold}5${c_rst}) Mount the Kindle now"
+        echo "  ${c_bold}6${c_rst}) Refresh status"
+        echo "  ${c_bold}q${c_rst}) Quit"
+        echo
+        read -rp "Choose: " choice
+        echo
+        case $choice in
+            1) run_sync ;;
+            2) run_sync --dry-run ;;
+            3) switch_to calibre ;;
+            4) switch_to gvfs ;;
+            5) do_mount ;;
+            6) : ;;
+            q|Q|"") return 0 ;;
+            *) echo "?" ;;
+        esac
+    done
+}
+
+# --------------------------------------------------------------------- main ---
+
+case "${1:-menu}" in
+    menu)              menu ;;
+    status)            print_status ;;
+    sync)              shift; run_sync "$@" ;;
+    calibre)           switch_to calibre ;;
+    gvfs)              switch_to gvfs ;;
+    mount)             do_mount ;;
+    -h|--help|help)    awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0" ;;
+    *) echo "usage: kindle [menu|status|sync [kosync-args]|calibre|gvfs|mount]" >&2; exit 2 ;;
+esac
